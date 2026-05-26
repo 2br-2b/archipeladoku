@@ -69,6 +69,7 @@ port receiveSlotData : (Decode.Value -> msg) -> Sub msg
 
 type alias Model =
     { animationsEnabled : Bool
+    , autoApplyServerChecks : Bool
     , autoFillCandidatesOnUnlock : Bool
     , autoRemoveInvalidCandidates : Bool
     , blockSize : Int
@@ -151,6 +152,7 @@ type alias Model =
     , seed : Random.Seed
     , seedInput : Int
     , selectedCell : ( Int, Int )
+    , serverCheckedLocations : Set Int
     , shiftDebounce : Int
     , showInputErrors : Bool
     , showToastMessages : Bool
@@ -276,6 +278,7 @@ type Msg
     | SolveSelectedCellRatioInputBlurred
     | SolveSelectedCellRatioInputChanged String
     | SolveSingleCandidatesPressed
+    | SyncSolvedFromServerPressed
     | ToggleCandidateModePressed
     | ToggleHighlightModePressed
     | TriggerDiscoTrapPressed
@@ -311,6 +314,7 @@ init flagsValue =
                 |> Result.withDefault defaultFlags
     in
     ( { animationsEnabled = True
+      , autoApplyServerChecks = False
       , autoFillCandidatesOnUnlock = False
       , autoRemoveInvalidCandidates = False
       , blockSize = 9
@@ -398,6 +402,7 @@ init flagsValue =
       , seed = Random.initialSeed (flags.seed + 1)
       , seedInput = flags.seed
       , selectedCell = ( 1, 1 )
+      , serverCheckedLocations = Set.empty
       , shiftDebounce = 0
       , showInputErrors = True
       , showToastMessages = True
@@ -518,7 +523,10 @@ update msg model =
 
         CellSelected ( row, col ) ->
             if Dict.member ( row, col ) model.solution then
-                ( { model | selectedCell = ( row, col ) }
+                ( { model
+                    | selectedCell = ( row, col )
+                    , autoApplyServerChecks = False
+                  }
                     |> updateHighlight
                 , Cmd.none
                 )
@@ -568,7 +576,11 @@ update msg model =
             )
 
         ConnectPressed ->
-            ( { model | gameState = Connecting }
+            ( { model
+                | gameState = Connecting
+                , autoApplyServerChecks = False
+                , serverCheckedLocations = Set.empty
+              }
             , connect
                 (Encode.object
                     [ ( "host", Encode.string model.host )
@@ -860,48 +872,8 @@ update msg model =
 
         GotCheckedLocations locationIds ->
             ( { model
-                | pendingSolvedBlocks =
-                    Set.union
-                        model.pendingSolvedBlocks
-                        (locationIds
-                            |> List.filterMap
-                                (\id ->
-                                    if id >= 1000000 && id < 2000000 then
-                                        Just (cellFromId id)
-
-                                    else
-                                        Nothing
-                                )
-                            |> Set.fromList
-                        )
-                , pendingSolvedCols =
-                    Set.union
-                        model.pendingSolvedCols
-                        (locationIds
-                            |> List.filterMap
-                                (\id ->
-                                    if id >= 3000000 && id < 4000000 then
-                                        Just (cellFromId id)
-
-                                    else
-                                        Nothing
-                                )
-                            |> Set.fromList
-                        )
-                , pendingSolvedRows =
-                    Set.union
-                        model.pendingSolvedRows
-                        (locationIds
-                            |> List.filterMap
-                                (\id ->
-                                    if id >= 2000000 && id < 3000000 then
-                                        Just (cellFromId id)
-
-                                    else
-                                        Nothing
-                                )
-                            |> Set.fromList
-                        )
+                | serverCheckedLocations =
+                    Set.union model.serverCheckedLocations (Set.fromList locationIds)
               }
             , Cmd.none
             )
@@ -909,7 +881,13 @@ update msg model =
 
         GotConnectionStatus status ->
             ( { model
-                | gameState =
+                | autoApplyServerChecks =
+                    if status && model.gameState == Connecting then
+                        True
+
+                    else
+                        model.autoApplyServerChecks
+                , gameState =
                     case ( status, model.gameState ) of
                         ( True, Connecting ) ->
                             Generating
@@ -1903,6 +1881,12 @@ update msg model =
                         )
                 , undoStack = pushUndoStack model
               }
+            , Cmd.none
+            )
+                |> andThen (updateState True)
+
+        SyncSolvedFromServerPressed ->
+            ( queueServerSolves model
             , Cmd.none
             )
                 |> andThen (updateState True)
@@ -3941,7 +3925,8 @@ updateState triggerAnimations model =
         Playing ->
             if model.autoRemoveInvalidCandidates then
                 applySteps
-                    [ updateStateChanges triggerAnimations
+                    [ updateStateApplyServerChecks
+                    , updateStateChanges triggerAnimations
                     , updateStateErrors
                     , updateStateRemoveInvalidCandidates
                     , updateStateErrors
@@ -3955,7 +3940,8 @@ updateState triggerAnimations model =
 
             else
                 applySteps
-                    [ updateStateChanges triggerAnimations
+                    [ updateStateApplyServerChecks
+                    , updateStateChanges triggerAnimations
                     , updateStateErrors
                     , updateStateScoutLocations
                     , updateStateGoal
@@ -3967,6 +3953,50 @@ updateState triggerAnimations model =
 
         _ ->
             ( model, Cmd.none )
+
+
+pendingServerSolves : Model -> Set Int
+pendingServerSolves model =
+    model.serverCheckedLocations
+        |> Set.filter (\id -> id >= 1000000 && id < 4000000)
+        |> (\ids -> Set.diff ids model.solvedLocations)
+
+
+queueServerSolves : Model -> Model
+queueServerSolves model =
+    let
+        cellsInRange : Int -> Int -> Set ( Int, Int )
+        cellsInRange low high =
+            pendingServerSolves model
+                |> Set.toList
+                |> List.filterMap
+                    (\id ->
+                        if id >= low && id < high then
+                            Just (cellFromId id)
+
+                        else
+                            Nothing
+                    )
+                |> Set.fromList
+    in
+    { model
+        | pendingSolvedBlocks = Set.union model.pendingSolvedBlocks (cellsInRange 1000000 2000000)
+        , pendingSolvedRows = Set.union model.pendingSolvedRows (cellsInRange 2000000 3000000)
+        , pendingSolvedCols = Set.union model.pendingSolvedCols (cellsInRange 3000000 4000000)
+    }
+
+
+updateStateApplyServerChecks : Model -> ( Model, Cmd Msg )
+updateStateApplyServerChecks model =
+    if model.autoApplyServerChecks then
+        ( queueServerSolves model
+        , Cmd.none
+        )
+
+    else
+        ( model
+        , Cmd.none
+        )
 
 
 updateStateItems : Model -> ( Model, Cmd Msg )
@@ -7669,6 +7699,31 @@ viewInfoPanelHelpers model =
                     ]
                     [ Html.text "Clear board" ]
                 ]
+            , if model.gameIsLocal then
+                Html.text ""
+
+              else
+                Html.div
+                    [ HA.class "row gap-m"
+                    , HA.style "align-items" "center"
+                    ]
+                    [ Html.button
+                        [ HA.class "button"
+                        , HA.disabled (Set.isEmpty (pendingServerSolves model))
+                        , HE.onClick SyncSolvedFromServerPressed
+                        ]
+                        [ Html.text
+                            (String.concat
+                                [ "Sync solved from server ("
+                                , String.fromInt (Set.size (pendingServerSolves model))
+                                , ")"
+                                ]
+                            )
+                        ]
+                    , viewOptionHint
+                        "sync-solved-from-server-hint"
+                        "Solves areas holding items collected on the server but not yet solved locally. This could be due to playing on another device, or another player collecting their items."
+                    ]
             ]
         ]
 
